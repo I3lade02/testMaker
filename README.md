@@ -124,15 +124,12 @@ Example project structure:
 
 ---
 
-## Roadmap ideas
+## Known probles
 
-- “Problems” window (list of errors/warnings with click-to-jump)
-- Multi-correct answers for “select all that apply”
-- Import from `.docx`
-- Export variants (A/B/C) with shuffled answers
+- Manual inserting text is throwing errors while auto-convert is ON
 
 ---
 
 ## License
 
-Choose a license for GitHub (e.g. MIT) and add a `LICENSE` file if you plan to share publicly.
+Unlicensed
