@@ -84,7 +84,7 @@ PySide6>=6.5
 ## Run
 
 ```bash
-python gift_formatter_gui.py
+python main.py
 ```
 
 ### App icon
