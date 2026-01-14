@@ -126,7 +126,7 @@ Example project structure:
 
 ## Known probles
 
-- Manual inserting text is throwing errors while auto-convert is ON
+- Manual inserting text is throwing errors while auto-convert is ON (fixed)
 
 ---
 
