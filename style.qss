@@ -1,0 +1,108 @@
+/* ===== GLOBAL ===== */
+* {
+    font-family: "Segoe UI", "Inter", "Roboto", sans-serif;
+    font-size: 13px;
+}
+
+QMainWindow {
+    background-color: #f7f8fa;
+}
+
+/* ===== TOOLBAR ===== */
+QToolBar {
+    background: #ffffff;
+    border-bottom: 1px solid #e6e6e6;
+    padding: 6px;
+    spacing: 6px;
+}
+
+QToolButton {
+    background: transparent;
+    border: none;
+    padding: 8px;
+    border-radius: 10px;
+}
+
+QToolButton:hover {
+    background: #eef2ff;
+}
+
+QToolButton:pressed {
+    background: #e0e7ff;
+}
+
+QToolButton:checked {
+    background: #dbeafe;
+}
+
+/* ===== LABELS ===== */
+QLabel {
+    color: #333;
+}
+
+QLabel#Title {
+    font-size: 16px;
+    font-weight: bold;
+}
+
+/* ===== CHECKBOX / COMBO ===== */
+QCheckBox, QComboBox {
+    padding: 4px;
+}
+
+QComboBox {
+    font-size: 14px;
+    padding: 6px 10px;
+    border-radius: 8px;
+}
+
+QComboBox QAbstractItemView {
+    padding: 6px;
+    font-size: 14px;
+}
+
+QComboBox:hover {
+    border-color: #7aa2f7;
+}
+
+/* ===== EDITORS ===== */
+QPlainTextEdit {
+    background: #ffffff;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 10px;
+    font-family: "JetBrains Mono", "Consolas", monospace;
+    font-size: 13px;
+}
+
+QPlainTextEdit:focus {
+    border: 1px solid #4f8cff;
+}
+
+/* ===== SPLITTER ===== */
+QSplitter::handle {
+    background: #e0e0e0;
+    height: 6px;
+}
+
+/* ===== STATUS BAR ===== */
+QStatusBar {
+    background: #ffffff;
+    border-top: 1px solid #e0e0e0;
+    padding: 4px;
+}
+
+/* ===== GROUP BOX ===== */
+QGroupBox {
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    margin-top: 8px;
+}
+
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 10px;
+    padding: 0 4px;
+    color: #555;
+    font-weight: bold;
+}

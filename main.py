@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 
+from PySide6 import QtCore
+
 from PySide6.QtCore import Qt, QTimer, QSettings
 from PySide6.QtGui import (
     QAction,
@@ -39,6 +41,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QListWidget,
     QListWidgetItem,
+    QStyle,
 )
 
 # Split blocks by one or more blank lines
@@ -79,6 +82,70 @@ class Stats:
     answers_max: int = 0
     answers_avg: float = 0.0
     unmarked_correct: int = 0
+
+LIGHT_QSS = """
+QMainWindow { background: #f7f8fa; }
+QToolBar { background: #ffffff; border-bottom: 1px solid #e6e6e6; padding: 6px; spacing: 6px; }
+QToolButton { background: transparent; border: none; padding: 8px; border-radius: 10px; }
+QToolButton:hover { background: #eef2ff; }
+QToolButton:pressed { background: #e0e7ff; }
+QToolButton:checked { background: #dbeafe; }
+
+QPlainTextEdit {
+    background: #ffffff;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 10px;
+    font-family: "JetBrains Mono","Consolas",monospace;
+    font-size: 13px;
+}
+QPlainTextEdit:focus { border: 1px solid #4f8cff; }
+
+QComboBox {
+    background: #ffffff;
+    border: 1px solid #cfd6dd;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 14px;
+}
+QStatusBar { background: #ffffff; border-top: 1px solid #e6e6e6; }
+"""
+
+DARK_QSS = """
+QMainWindow { background: #0f1115; color: #e7eaf0; }
+QToolBar { background: #151924; border-bottom: 1px solid #252b3a; padding: 6px; spacing: 6px; }
+QToolButton { background: transparent; border: none; padding: 8px; border-radius: 10px; color: #e7eaf0; }
+QToolButton:hover { background: #222a3a; }
+QToolButton:pressed { background: #2a3550; }
+QToolButton:checked { background: #25314a; }
+
+QLabel { color: #e7eaf0; }
+QGroupBox { border: 1px solid #252b3a; border-radius: 8px; margin-top: 8px; color: #e7eaf0; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 4px; color: #cfd6e6; font-weight: bold; }
+
+QPlainTextEdit {
+    background: #0f141f;
+    border: 1px solid #252b3a;
+    border-radius: 8px;
+    padding: 10px;
+    color: #e7eaf0;
+    selection-background-color: #2a3d66;
+    font-family: "JetBrains Mono","Consolas",monospace;
+    font-size: 13px;
+}
+QPlainTextEdit:focus { border: 1px solid #4f8cff; }
+
+QComboBox {
+    background: #0f141f;
+    border: 1px solid #252b3a;
+    border-radius: 8px;
+    padding: 6px 10px;
+    font-size: 14px;
+    color: #e7eaf0;
+}
+
+QStatusBar { background: #151924; border-top: 1px solid #252b3a; color: #cfd6e6; }
+"""
 
 
 @dataclass
@@ -474,6 +541,8 @@ class InputHighlighter(QSyntaxHighlighter):
         self.fmt_error = QTextCharFormat()
         self.fmt_error.setForeground(QColor("#b71c1c"))
         self.fmt_error.setUnderlineStyle(QTextCharFormat.SingleUnderline)
+
+        self.theme = "light"
 
     def highlightBlock(self, text: str):
         s = text.rstrip("\n")
@@ -907,8 +976,10 @@ class GiftFormatterMainWindow(QMainWindow):
         self.correct_combo = QComboBox()
         self.correct_combo.setEditable(True)
         self.correct_combo.addItems(["a", "b", "c", "d", "1", "2", "3", "4"])
-        self.correct_combo.setCurrentText("a")
-        self.correct_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.correct_combo.setCurrentIndex(0)
+
+        self.correct_combo.setMinimumWidth(80)
+        self.correct_combo.setMinimumHeight(32)
         controls.addWidget(self.correct_combo)
 
         self.assume_default_cb = QCheckBox()
@@ -918,10 +989,6 @@ class GiftFormatterMainWindow(QMainWindow):
         self.tolerant_cb = QCheckBox()
         self.tolerant_cb.setChecked(True)
         controls.addWidget(self.tolerant_cb)
-
-        self.auto_cb = QCheckBox()
-        self.auto_cb.setChecked(True)
-        controls.addWidget(self.auto_cb)
 
         controls.addSpacing(16)
 
@@ -952,6 +1019,7 @@ class GiftFormatterMainWindow(QMainWindow):
         self.output_edit.setReadOnly(True)
 
         self.highlighter = InputHighlighter(self.input_edit.document())
+        self.input_edit.cursorPositionChanged.connect(self._refresh_block_highlight)
 
         self.splitter = QSplitter(Qt.Vertical)
         input_wrap = QWidget()
@@ -1014,6 +1082,74 @@ class GiftFormatterMainWindow(QMainWindow):
 
         self.status.showMessage(self.tr_("status_ready"), 4000)
 
+    def _icon(self, theme_name: str, fallback: QStyle.StandardPixmap) -> QIcon:
+        ico = QIcon.fromTheme(theme_name)
+        if not ico.isNull():
+            return ico
+        return self.style().standardIcon(fallback)
+    
+    def apply_theme(self, theme: str):
+        theme = "dark" if str(theme).lower() == "dark" else "light"
+        self.theme = theme
+        qss = DARK_QSS if theme == "dark" else LIGHT_QSS
+        QApplication.instance().setStyleSheet(qss)
+
+        #IDE highlight se mění podle theme
+        self._refresh_block_highlight()
+
+        if hasattr(self, "act_theme"):
+            self.act_theme.blockSignals(True)
+            self.act_theme.setChecked(self.theme == "dark")
+            self.act_theme.blockSignals(False)
+
+    def toggle_theme(self, checked: bool):
+        new_theme = "dark" if checked else "light"
+        self.apply_theme(new_theme)
+        self.settings.setValue("ui/theme", new_theme)
+
+    def _refresh_block_highlight(self):
+        try:
+            text = self.input_edit_toPlainText()
+            if not text.strip():
+                self.input_edit.setExtraSelections([])
+                return
+            
+            cursor = self.input_edit.textCursor()
+            pos = cursor.position()
+
+            blocks = iter_blocks_with_spans(text)
+            if not blocks:
+                self.input_edit.setExtraSelections([])
+                return
+            
+            active = None
+            for b in blocks:
+                if b.start <= pos <= b.end:
+                    active = b
+                    break
+
+            if active is None:
+                self.input_edit.setExtraSelections([])
+                return
+            
+            #set color based on theme
+            bg = QColor("#eef2ff") if self.theme != "dark" else QColor("#1b2335")
+            bg.setAlpha(120)
+
+            sel = QPlainTextEdit.ExtraSelection()
+            fmt = sel.format
+            fmt.setBackground(bg)
+
+            c = self.input_edit.textCursor()
+            c.setPosition(active.start)
+            c.setPosition(active.end, QTextCursor.KeepAnchor)
+            sel.cursor = c
+
+            self.input_edit.setExtraSelections([sel])
+        except Exception:
+            pass
+
+
     # -------- i18n --------
 
     def tr_(self, key: str, **kwargs: Any) -> str:
@@ -1031,7 +1167,7 @@ class GiftFormatterMainWindow(QMainWindow):
 
         self.lbl_default_correct.setText(self.tr_("controls_default_correct"))
         self.assume_default_cb.setText(self.tr_("controls_use_default"))
-        self.auto_cb.setText(self.tr_("controls_auto"))
+        self.act_auto.setText(self.tr_("controls_auto"))
         self.tolerant_cb.setText(self.tr_("controls_tolerant"))
         self.lbl_language.setText(self.tr_("controls_language"))
         self.lbl_multi_mode.setText(self.tr_("controls_multi_mode"))
@@ -1049,19 +1185,19 @@ class GiftFormatterMainWindow(QMainWindow):
         self.lbl_output.setText(self.tr_("label_output"))
 
         self.correct_combo.setToolTip(self.tr_("tooltip_default_correct"))
-        self.auto_cb.setToolTip(self.tr_("tooltip_auto"))
+        self.act_auto.setToolTip(self.tr_("tooltip_auto"))
         self.tolerant_cb.setToolTip(self.tr_("tooltip_tolerant"))
         self.multi_mode_combo.setToolTip(self.tr_("tooltip_multi_mode"))
 
         self.input_edit.setPlaceholderText(self.tr_("placeholder"))
 
-        self.act_convert.setText(self.tr_("toolbar_convert"))
-        self.act_copy.setText(self.tr_("toolbar_copy"))
-        self.act_save.setText(self.tr_("toolbar_save"))
-        self.act_clear.setText(self.tr_("toolbar_clear"))
-        self.act_stats.setText(self.tr_("toolbar_stats"))
+        self.act_convert.setToolTip(self.tr_("toolbar_convert"))
+        self.act_copy.setToolTip(self.tr_("toolbar_copy"))
+        self.act_save.setToolTip(self.tr_("toolbar_save"))
+        self.act_clear.setToolTip(self.tr_("toolbar_clear"))
+        self.act_stats.setToolTip(self.tr_("toolbar_stats"))
         self.act_stats.setToolTip(self.tr_("tooltip_stats"))
-        self.act_preview.setText(self.tr_("toolbar_preview"))
+        self.act_preview.setToolTip(self.tr_("toolbar_preview"))
         self.act_preview.setToolTip(self.tr_("tooltip_preview"))
 
         self.act_auto.setText(self.tr_("toolbar_auto"))
@@ -1071,6 +1207,8 @@ class GiftFormatterMainWindow(QMainWindow):
         self.act_issues.setToolTip(self.tr_("tooltip_issues"))
 
         self.lbl_author.setText(self.tr_("author_label"))
+
+        self.act_theme.setToolTip("Dark Mode" if self.lang == "en" else "Tmavý režim")
 
         if self.stats_dialog is not None:
             was_visible = self.stats_dialog.isVisible()
@@ -1102,60 +1240,76 @@ class GiftFormatterMainWindow(QMainWindow):
     def _build_toolbar(self):
         tb = QToolBar("Main")
         tb.setMovable(False)
-        tb.setToolButtonStyle(Qt.ToolButtonTextOnly)
+
+        # icon-only modern look
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        tb.setIconSize(QtCore.QSize(20, 20))  
+        tb.setContentsMargins(8, 6, 8, 6)
+
         self.addToolBar(tb)
 
-        self.act_convert = QAction("", self)
+        # --- Actions ---
+        self.act_convert = QAction(self._icon("view-refresh", QStyle.SP_BrowserReload), "", self)
         self.act_convert.setShortcut("Ctrl+Enter")
         self.act_convert.triggered.connect(self.convert_now)
         tb.addAction(self.act_convert)
 
-        self.act_copy = QAction("", self)
+        self.act_copy = QAction(self._icon("edit-copy", QStyle.SP_DialogOpenButton), "", self)
         self.act_copy.setShortcut("Ctrl+Shift+C")
         self.act_copy.triggered.connect(self.copy_output)
         tb.addAction(self.act_copy)
 
-        self.act_save = QAction("", self)
+        self.act_save = QAction(self._icon("document-save", QStyle.SP_DialogSaveButton), "", self)
         self.act_save.setShortcut("Ctrl+S")
         self.act_save.triggered.connect(self.save_gift)
         tb.addAction(self.act_save)
 
-        self.act_clear = QAction("", self)
+        self.act_clear = QAction(self._icon("edit-clear", QStyle.SP_DialogResetButton), "", self)
         self.act_clear.setShortcut("Ctrl+L")
         self.act_clear.triggered.connect(self.clear_all)
         tb.addAction(self.act_clear)
 
         tb.addSeparator()
 
-        self.act_stats = QAction("", self)
+        self.act_stats = QAction(self._icon("view-statistics", QStyle.SP_FileDialogInfoView), "", self)
         self.act_stats.setShortcut("Ctrl+I")
         self.act_stats.triggered.connect(self.show_stats)
         tb.addAction(self.act_stats)
 
-        self.act_preview = QAction("", self)
+        self.act_preview = QAction(self._icon("view-preview", QStyle.SP_FileDialogContentsView), "", self)
         self.act_preview.setShortcut("Ctrl+P")
         self.act_preview.triggered.connect(self.show_preview)
         tb.addAction(self.act_preview)
 
-        self.act_issues = QAction("", self)
+        self.act_issues = QAction(self._icon("dialog-warning", QStyle.SP_MessageBoxWarning), "", self)
         self.act_issues.setShortcut("Ctrl+W")
         self.act_issues.triggered.connect(self.show_issues)
         tb.addAction(self.act_issues)
 
         tb.addSeparator()
 
-        self.act_auto = QAction("", self)
+        self.act_auto = QAction(self._icon("media-playback-start", QStyle.SP_MediaPlay), "", self)
         self.act_auto.setCheckable(True)
         self.act_auto.setChecked(True)
         self.act_auto.triggered.connect(self._toggle_auto_from_action)
         tb.addAction(self.act_auto)
 
+        tb.addSeparator()
+
+        self.act_theme = QAction(self._icon("weather-clear-night", QStyle.SP_TitleBarShadeButton), "", self)
+        self.act_theme.setCheckable(True)
+        self.act_theme.setChecked(False) #default light
+        self.act_theme.triggered.connect(self.toggle_theme)
+        tb.addAction(self.act_theme)
+
+
     def _toggle_auto_from_action(self, checked: bool):
-        self.auto_cb.setChecked(checked)
         self.status.showMessage(
-            ("Auto: ON" if self.lang == "en" else "Auto: ZAP") if checked else ("Auto: OFF" if self.lang == "en" else "Auto: VYP"),
+            ("Auto: ON" if self.lang == "en" else "Auto: ZAP") if checked
+            else ("Auto: OFF" if self.lang == "en" else "Auto: VYP"),
             2000,
         )
+        self.settings.setValue("ui/auto_convert", checked)
 
     # -------- QSettings --------
 
@@ -1171,12 +1325,13 @@ class GiftFormatterMainWindow(QMainWindow):
         tolerant = self.settings.value("ui/tolerant", True, type=bool)
         default_key = self.settings.value("ui/default_correct", "a")
         multi_mode = self.settings.value("ui/multi_mode", "wipe")
+        theme = self.settings.value("ui/theme", "light")
 
-        self.auto_cb.setChecked(bool(auto))
         self.act_auto.setChecked(bool(auto))
         self.assume_default_cb.setChecked(bool(assume_default))
         self.tolerant_cb.setChecked(bool(tolerant))
         self.correct_combo.setCurrentText(str(default_key))
+        self.apply_theme(str(theme))
 
         self.multi_mode_combo.setCurrentIndex(1 if str(multi_mode) == "penalize" else 0)
 
@@ -1196,7 +1351,7 @@ class GiftFormatterMainWindow(QMainWindow):
 
     def save_settings(self):
         self.settings.setValue("ui/lang", self.lang_combo.currentData() or self.lang)
-        self.settings.setValue("ui/auto_convert", self.auto_cb.isChecked())
+        self.settings.setValue("ui/auto_convert", self.act_auto.isChecked())
         self.settings.setValue("ui/assume_default", self.assume_default_cb.isChecked())
         self.settings.setValue("ui/tolerant", self.tolerant_cb.isChecked())
         self.settings.setValue("ui/default_correct", self.correct_combo.currentText().strip() or "a")
@@ -1211,13 +1366,10 @@ class GiftFormatterMainWindow(QMainWindow):
     # -------- UI helpers --------
 
     def _on_text_changed(self, *_args):
-        if self.act_auto.isChecked() != self.auto_cb.isChecked():
-            self.act_auto.setCheckable(True)
-            self.act_auto.setChecked(self.auto_cb.isChecked())
-
-        if not self.auto_cb.isChecked():
+        if not self.act_auto.isChecked():
             return
         self._timer.start(3000)
+
 
     def highlight_span(self, start: int, end: int):
         cursor = self.input_edit.textCursor()
@@ -1251,10 +1403,13 @@ class GiftFormatterMainWindow(QMainWindow):
 
     def convert_now(self, silent: bool = False, from_auto: bool = False):
         text = self.input_edit.toPlainText()
-        default_key = self.correct_combo.currentText().strip() or "a"
+        default_key = (self.correct_combo.currentText() or "a").strip()
         assume_default = self.assume_default_cb.isChecked()
         tolerant = self.tolerant_cb.isChecked()
         multi_mode = self.multi_mode_combo.currentData() or "wipe"
+
+        if default_key.endswith(")"):
+            default_key = default_key[:-1]
 
         text_for_convert = text_without_last_incomplete_block(text) if from_auto else text
 
@@ -1385,6 +1540,9 @@ class GiftFormatterMainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+
+    with open("style.qss", "r", encoding="utf-8") as f:
+        app.setStyleSheet(f.read())
 
     icon_path = Path(__file__).parent / "icon.png"
     if icon_path.exists():
