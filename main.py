@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QButtonGroup,
     QPushButton,
+    QListWidget,
+    QListWidgetItem,
 )
 
 # Split blocks by one or more blank lines
@@ -83,7 +85,7 @@ class Stats:
 class QuestionItem:
     question: str
     answers: List[str]
-    correct_index: Optional[int]  # None if not found (shouldn't happen if default is used)
+    correct_indices: List[int]  # multiple correct supported
 
 
 def iter_blocks_with_spans(text: str) -> List[BlockSpan]:
@@ -127,33 +129,74 @@ def normalize_question_line(q: str) -> str:
     return q
 
 
+def text_without_last_incomplete_block(full_text: str) -> str:
+    """
+    For auto-convert: ignore the last block if it's incomplete (draft).
+    This prevents errors while the user is still typing.
+    """
+    blocks = iter_blocks_with_spans(full_text)
+    if not blocks:
+        return full_text
+
+    last = blocks[-1]
+    lines = [ln.strip() for ln in last.text.splitlines() if ln.strip()]
+
+    # Incomplete if only question line or nothing
+    if len(lines) < 2:
+        return full_text[: last.start].rstrip()
+
+    # If there are lines, but no answer-like prefixes yet, treat as draft
+    answer_lines = lines[1:]
+    has_any_answer_prefix = any(
+        ANSWER_RE.match(ln) or MARKED_CORRECT_RE.match(ln) for ln in answer_lines
+    )
+    if not has_any_answer_prefix:
+        return full_text[: last.start].rstrip()
+
+    return full_text
+
+
+# ---------- Multiple-correct export helpers ----------
+
+def distribute_weights(count: int, total: float, decimals: int = 3) -> List[float]:
+    """
+    Returns `count` weights that sum to `total`, with rounding.
+    The last value is adjusted to preserve exact sum (within float precision).
+    """
+    if count <= 0:
+        return []
+    if count == 1:
+        return [round(total, decimals)]
+    raw = total / count
+    w = [round(raw, decimals) for _ in range(count)]
+    s = sum(w[:-1])
+    w[-1] = round(total - s, decimals)
+    return w
+
+
+def fmt_pct(x: float, decimals: int = 3) -> str:
+    s = f"{x:.{decimals}f}".rstrip("0").rstrip(".")
+    if s == "-0":
+        s = "0"
+    return s
+
+
 # ---------- Tolerant auto-fix helpers ----------
 
-# Matches "a) text", "a. text", "a ) text", "a )* text", "A.*text", "1. text", etc.
 TOLERANT_PREFIX_RE = re.compile(
     r"^\s*([a-zA-Z]|\d+)\s*[\)\.]\s*(\*)?\s*(.*)\s*$"
 )
 
 
 def autocorrect_answer_line(line: str) -> Tuple[str, int]:
-    """
-    Try to convert many variants into canonical:
-    a) text
-    a)* text
-    1) text
-    1)* text
-    Returns (new_line, fixes_count)
-    """
     original = line
     s = line.strip()
 
-    # Normalize tabs/multiple spaces a bit (but keep content)
     s = re.sub(r"\t+", " ", s)
     s = re.sub(r" {2,}", " ", s)
 
     m = TOLERANT_PREFIX_RE.match(s)
     if not m:
-        # Also try patterns like "a)*text" without space
         m2 = re.match(r"^\s*([a-zA-Z]|\d+)\)\*\s*(.*)\s*$", s)
         if m2:
             key = m2.group(1)
@@ -180,17 +223,10 @@ def autocorrect_answer_line(line: str) -> Tuple[str, int]:
 
 
 def autocorrect_block_text(block_text: str) -> Tuple[str, int]:
-    """
-    Applies tolerant fixes:
-    - trims weird spacing
-    - normalizes answer prefixes like A. / 1. / a )* ...
-    Keeps question line as-is (question normalization happens later).
-    """
     lines = block_text.splitlines()
     out_lines: List[str] = []
     fixes = 0
 
-    # First non-empty line is question, leave it mostly, just strip trailing spaces
     seen_question = False
     for ln in lines:
         raw = ln.rstrip("\n")
@@ -202,7 +238,6 @@ def autocorrect_block_text(block_text: str) -> Tuple[str, int]:
             seen_question = True
             continue
 
-        # After question: answers & other lines
         if raw.strip() == "":
             out_lines.append(raw)
             continue
@@ -220,14 +255,14 @@ def parse_block(
     block_text: str,
     tolerant: bool = False,
 ) -> Tuple[
-    Optional[Tuple[str, List[Tuple[str, str, bool]], Optional[str]]],
+    Optional[Tuple[str, List[Tuple[str, str, bool]], List[str]]],
     Optional[str],
     int
 ]:
     """
-    Returns (question, answers, marked_correct_key), error, fixes_count
+    Returns (question, answers, marked_correct_keys), error, fixes_count
     answers: list of (key, text, is_marked_correct)
-    key: 'a' or '1' etc
+    marked_correct_keys: list of keys (can be empty)
     """
     fixes = 0
     text_to_parse = block_text
@@ -243,7 +278,7 @@ def parse_block(
     raw_answers = lines[1:]
 
     answers: List[Tuple[str, str, bool]] = []
-    marked_correct_key: Optional[str] = None
+    marked_correct_keys: List[str] = []
 
     for ln in raw_answers:
         m_marked = MARKED_CORRECT_RE.match(ln)
@@ -252,10 +287,7 @@ def parse_block(
             key_norm = key.lower() if key.isalpha() else key
             text = m_marked.group(2).strip()
             answers.append((key_norm, text, True))
-
-            if marked_correct_key is not None and marked_correct_key != key_norm:
-                return None, "Multiple answers are marked correct using ')*'.", fixes
-            marked_correct_key = key_norm
+            marked_correct_keys.append(key_norm)
             continue
 
         m = ANSWER_RE.match(ln)
@@ -266,7 +298,16 @@ def parse_block(
         text = m.group(2).strip()
         answers.append((key_norm, text, False))
 
-    return (question, answers, marked_correct_key), None, fixes
+    # Remove duplicates in marked_correct_keys while keeping order
+    seen = set()
+    dedup = []
+    for k in marked_correct_keys:
+        if k not in seen:
+            dedup.append(k)
+            seen.add(k)
+    marked_correct_keys = dedup
+
+    return (question, answers, marked_correct_keys), None, fixes
 
 
 def convert_blocks_with_positions(
@@ -274,6 +315,8 @@ def convert_blocks_with_positions(
     default_correct_key: str = "a",
     assume_default_if_unmarked: bool = True,
     tolerant: bool = False,
+    multi_mode: str = "wipe",  # "wipe" or "penalize"
+    pct_decimals: int = 3,
 ) -> Tuple[str, List[ConvertIssue], Stats, int, List[QuestionItem]]:
     blocks = iter_blocks_with_spans(all_text)
     stats = Stats(blocks_total=len(blocks))
@@ -297,17 +340,20 @@ def convert_blocks_with_positions(
             stats.blocks_error += 1
             continue
 
-        question, answers, marked_correct = parsed
+        question, answers, marked_correct_keys = parsed
         answer_counts.append(len(answers))
         stats.blocks_ok += 1
 
-        if marked_correct is None:
+        if not marked_correct_keys:
             stats.unmarked_correct += 1
 
-        correct_key = marked_correct
-        if correct_key is None:
+        keys_in_block = [k for (k, _t, _m) in answers]
+
+        correct_keys: List[str] = list(marked_correct_keys)
+
+        if not correct_keys:
             if assume_default_if_unmarked:
-                correct_key = default_key_norm
+                correct_keys = [default_key_norm]
             else:
                 issues.append(
                     ConvertIssue(
@@ -322,43 +368,79 @@ def convert_blocks_with_positions(
                 stats.blocks_error += 1
                 continue
 
-        keys_in_block = [k for (k, _t, _m) in answers]
-        if correct_key not in keys_in_block:
+        missing = [k for k in correct_keys if k not in keys_in_block]
+        if missing:
             fallback = keys_in_block[0]
             issues.append(
                 ConvertIssue(
                     idx,
-                    f"Default correct '{correct_key}' not found in answers; used first answer '{fallback}' instead.",
+                    f"Correct key(s) {missing} not found in answers; used first answer '{fallback}' instead.",
                     block.start,
                     block.end,
                     "warning",
                 )
             )
             stats.warnings += 1
-            correct_key = fallback
+            correct_keys = [fallback]
 
-        # Build GIFT output
+        is_multi = len(correct_keys) >= 2
+
         q_line = normalize_question_line(question)
         out_lines = [f"{q_line} {{"]
 
-        correct_index = None
-        ans_texts: List[str] = []
+        ans_texts: List[str] = [t for (_k, t, _m) in answers]
+        correct_indices: List[int] = []
 
-        for i, (key, text, _is_marked) in enumerate(answers):
-            ans_texts.append(text)
-            prefix = "=" if key == correct_key else "~"
-            out_lines.append(prefix + text)
-            if key == correct_key:
-                correct_index = i
+        if not is_multi:
+            correct_key = correct_keys[0]
+            for i, (key, text, _is_marked) in enumerate(answers):
+                prefix = "=" if key == correct_key else "~"
+                out_lines.append(prefix + text)
+                if key == correct_key:
+                    correct_indices = [i]
+            out_lines.append("}")
+            outputs.append("\n".join(out_lines))
+        else:
+            # Multiple-correct: use ~%weights% style (matching your examples)
+            c_weights = distribute_weights(len(correct_keys), 100.0, decimals=pct_decimals)
+            correct_weight_map: Dict[str, float] = {k: w for k, w in zip(correct_keys, c_weights)}
 
-        out_lines.append("}")
-        outputs.append("\n".join(out_lines))
+            wrong_keys = [k for k in keys_in_block if k not in correct_keys]
+            wrong_weight_map: Dict[str, float] = {}
+
+            if str(multi_mode) == "wipe":
+                # A) wipe: any wrong selection removes all points
+                wrong_weight_map = {k: -100.0 for k in wrong_keys}
+            elif str(multi_mode) == "penalize":
+                # B) partial: split -100 across wrong answers
+                if len(wrong_keys) > 0:
+                    w_weights = distribute_weights(len(wrong_keys), -100.0, decimals=pct_decimals)
+                    wrong_weight_map = {k: w for k, w in zip(wrong_keys, w_weights)}
+
+            for i, (key, text, _is_marked) in enumerate(answers):
+                if key in correct_weight_map:
+                    w = correct_weight_map[key]
+                    out_lines.append(f"~%{fmt_pct(w, pct_decimals)}%{text}")
+                    correct_indices.append(i)
+                else:
+                    if key in wrong_weight_map:
+                        w = wrong_weight_map[key]
+                        out_lines.append(f"~%{fmt_pct(w, pct_decimals)}%{text}")
+                    else:
+                        out_lines.append("~" + text)
+
+            out_lines.append("}")
+            outputs.append("\n".join(out_lines))
+
+        display_q = q_line
+        if display_q.endswith(" ?"):
+            display_q = display_q[:-2].rstrip()
 
         questions.append(
             QuestionItem(
-                question=q_line[:-2].strip(),  # without trailing " ?"
+                question=display_q,
                 answers=ans_texts,
-                correct_index=correct_index,
+                correct_indices=correct_indices,
             )
         )
 
@@ -410,8 +492,6 @@ class InputHighlighter(QSyntaxHighlighter):
             self.setCurrentBlockState(self.STATE_EXPECT_ANSWERS)
             return
 
-        # Highlight only canonical patterns; tolerant input may show red until fixed,
-        # but that's OK: it helps the user see what would be fixed by tolerant mode.
         if MARKED_CORRECT_RE.match(s):
             self.setFormat(0, len(s), self.fmt_correct)
         elif ANSWER_RE.match(s):
@@ -484,6 +564,55 @@ class StatsDialog(QDialog):
         self.lbl_ans_avg.setText(f"{stats.answers_avg:.2f}")
         self.lbl_unmarked.setText(str(stats.unmarked_correct))
         self.lbl_fixes.setText(str(fixes_count))
+
+
+# ---------- Issues dialog ----------
+
+class IssuesDialog(QDialog):
+    def __init__(self, parent: QWidget, tr_func, jump_callback):
+        super().__init__(parent)
+        self.tr_ = tr_func
+        self.jump_callback = jump_callback
+        self.setModal(False)
+        self.setWindowTitle(self.tr_("issues_title"))
+
+        layout = QVBoxLayout(self)
+
+        self.listw = QListWidget()
+        self.listw.itemDoubleClicked.connect(self._on_open)
+        layout.addWidget(self.listw)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        btns.rejected.connect(self.close)
+        btns.accepted.connect(self.close)
+        layout.addWidget(btns)
+
+        self.resize(760, 420)
+
+    def set_issues(self, issues: List[ConvertIssue]):
+        self.listw.clear()
+
+        if not issues:
+            item = QListWidgetItem(self.tr_("issues_empty"))
+            item.setFlags(Qt.NoItemFlags)
+            self.listw.addItem(item)
+            return
+
+        ordered = sorted(issues, key=lambda x: (0 if x.severity == "error" else 1, x.block_index))
+
+        for it in ordered:
+            prefix = "ERROR" if it.severity == "error" else "WARNING"
+            text = f"[{prefix}] Block {it.block_index}: {it.message}"
+            item = QListWidgetItem(text)
+            item.setData(Qt.UserRole, (it.start, it.end))
+            self.listw.addItem(item)
+
+    def _on_open(self, item: QListWidgetItem):
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        start, end = data
+        self.jump_callback(start, end)
 
 
 # ---------- Preview (Student view) ----------
@@ -570,15 +699,16 @@ class PreviewDialog(QDialog):
         self._clear_answers()
 
         show_correct = self.cb_show_correct.isChecked()
+        correct_set = set(q.correct_indices or [])
+
         for i, ans in enumerate(q.answers):
             rb = QRadioButton(ans)
             self.btn_group.addButton(rb, i)
             self._answers_layout.addWidget(rb)
             self.answer_buttons.append(rb)
 
-            # highlight correct if requested
-            if show_correct and q.correct_index is not None and i == q.correct_index:
-                rb.setStyleSheet("font-weight: 600;")
+            if show_correct and i in correct_set:
+                rb.setStyleSheet("font-weight: 900; font-size: 14px;")
             else:
                 rb.setStyleSheet("")
 
@@ -619,6 +749,9 @@ class GiftFormatterMainWindow(QMainWindow):
                 "controls_auto": "Auto převod",
                 "controls_tolerant": "Tolerantní režim (auto-opravy)",
                 "controls_language": "Jazyk:",
+                "controls_multi_mode": "Více správných (export):",
+                "multi_wipe": "A) Smazat body při chybě (−100% za špatnou)",
+                "multi_penalize": "B) Částečně penalizovat (−100% rozdělit mezi špatné)",
                 "label_input": "Vstup:",
                 "label_output": "Výstup:",
                 "toolbar_convert": "🔄 Převést",
@@ -628,12 +761,17 @@ class GiftFormatterMainWindow(QMainWindow):
                 "toolbar_stats": "📊 Statistiky",
                 "toolbar_preview": "👩‍🎓 Náhled",
                 "toolbar_auto": "⚡ Auto",
+                "toolbar_issues": "⚠️ Problémy",
                 "tooltip_default_correct": "Použije se, pokud žádná odpověď není označená pomocí ')*'.",
                 "tooltip_auto": "Automaticky převádí chvíli po dopsání.",
                 "tooltip_tolerant": "Zkusí automaticky opravit běžné chyby formátu (A., 1., mezery...).",
+                "tooltip_multi_mode": "Použije se jen pro bloky s 2+ správnými odpověďmi (více ')*').",
                 "tooltip_stats": "Otevřít okno se statistikou posledního převodu.",
                 "tooltip_preview": "Zobrazí otázky jako student (náhled).",
                 "tooltip_auto_action": "Přepnout automatický převod při psaní.",
+                "tooltip_issues": "Zobrazit seznam varování/chyb a skočit na blok.",
+                "issues_title": "Problémy (varování a chyby)",
+                "issues_empty": "Žádná varování ani chyby.",
                 "status_ready": "Připraveno. Vlož otázky do vstupu.",
                 "status_cleared": "Vymazáno.",
                 "status_empty": "Vstup je prázdný.",
@@ -662,22 +800,21 @@ class GiftFormatterMainWindow(QMainWindow):
                 "preview_answers": "Odpovědi",
                 "preview_prev": "Předchozí",
                 "preview_next": "Další",
-                "preview_show_correct": "Ukázat správnou",
+                "preview_show_correct": "Ukázat správné",
                 "preview_counter": "Otázka {i} / {n}",
                 "preview_empty": "Žádné otázky",
+                "author_label": "Autor: Ondřej Beránek",
                 "placeholder": (
                     "Odděluj otázky prázdným řádkem.\n"
                     "Odpovědi mohou být 'a) ...' nebo '1) ...'.\n"
                     "Správnou označ pomocí 'a)*' nebo '1)*'.\n"
+                    "Pro více správných odpovědí označ více řádků ')*'.\n"
                     "Konec otázky ':' se při převodu odstraní.\n\n"
-                    "Příklad:\n"
+                    "Příklad (multiple):\n"
                     "Text otázky:\n"
-                    "1)* Správně\n"
-                    "2) Špatně\n"
-                    "3) Špatně\n\n"
-                    "Další otázka?\n"
                     "a)* Správně\n"
                     "b) Špatně\n"
+                    "c)* Správně\n"
                 ),
             },
             "en": {
@@ -687,6 +824,9 @@ class GiftFormatterMainWindow(QMainWindow):
                 "controls_auto": "Auto convert",
                 "controls_tolerant": "Tolerant mode (auto-fixes)",
                 "controls_language": "Language:",
+                "controls_multi_mode": "Multiple correct (export):",
+                "multi_wipe": "A) Wipe on mistake (−100% per wrong)",
+                "multi_penalize": "B) Partial penalty (split −100% among wrong)",
                 "label_input": "Input:",
                 "label_output": "Output:",
                 "toolbar_convert": "🔄 Convert",
@@ -696,12 +836,17 @@ class GiftFormatterMainWindow(QMainWindow):
                 "toolbar_stats": "📊 Stats",
                 "toolbar_preview": "👩‍🎓 Preview",
                 "toolbar_auto": "⚡ Auto",
+                "toolbar_issues": "⚠️ Issues",
                 "tooltip_default_correct": "Used if no answer is marked with ')*'.",
                 "tooltip_auto": "Automatically converts a moment after you stop typing.",
                 "tooltip_tolerant": "Tries to automatically fix common formatting issues (A., 1., spacing...).",
+                "tooltip_multi_mode": "Applied only to blocks with 2+ correct answers (multiple ')*').",
                 "tooltip_stats": "Open stats window for the last conversion.",
                 "tooltip_preview": "Show questions like a student (preview).",
                 "tooltip_auto_action": "Toggle automatic conversion while typing.",
+                "tooltip_issues": "Show warnings/errors list and jump to a block.",
+                "issues_title": "Issues (warnings and errors)",
+                "issues_empty": "No warnings or errors.",
                 "status_ready": "Ready. Paste your questions into Input.",
                 "status_cleared": "Cleared.",
                 "status_empty": "Input is empty.",
@@ -733,19 +878,18 @@ class GiftFormatterMainWindow(QMainWindow):
                 "preview_show_correct": "Show correct",
                 "preview_counter": "Question {i} / {n}",
                 "preview_empty": "No questions",
+                "author_label": "Author: Ondřej Beránek",
                 "placeholder": (
                     "Separate questions by blank lines.\n"
                     "Answers can be 'a) ...' or '1) ...'.\n"
-                    "Mark the correct answer with 'a)*' or '1)*'.\n"
+                    "Mark correct answers with 'a)*' or '1)*'.\n"
+                    "For multiple correct, mark multiple lines with ')*'.\n"
                     "Question ending ':' will be removed.\n\n"
-                    "Example:\n"
+                    "Example (multiple):\n"
                     "Question text:\n"
-                    "1)* Correct\n"
-                    "2) Wrong\n"
-                    "3) Wrong\n\n"
-                    "Another question?\n"
                     "a)* Correct\n"
                     "b) Wrong\n"
+                    "c)* Correct\n"
                 ),
             },
         }
@@ -778,6 +922,16 @@ class GiftFormatterMainWindow(QMainWindow):
         self.auto_cb = QCheckBox()
         self.auto_cb.setChecked(True)
         controls.addWidget(self.auto_cb)
+
+        controls.addSpacing(16)
+
+        self.lbl_multi_mode = QLabel()
+        controls.addWidget(self.lbl_multi_mode)
+
+        self.multi_mode_combo = QComboBox()
+        self.multi_mode_combo.addItem("A) Wipe on mistake", "wipe")
+        self.multi_mode_combo.addItem("B) Partial penalty", "penalize")
+        controls.addWidget(self.multi_mode_combo)
 
         controls.addSpacing(16)
 
@@ -820,9 +974,14 @@ class GiftFormatterMainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 2)
         layout.addWidget(self.splitter, 1)
 
-        # Status
+        # Status + author label
         self.status = QStatusBar()
         self.setStatusBar(self.status)
+
+        self.lbl_author = QLabel("")
+        self.lbl_author.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.lbl_author.setStyleSheet("color: #666;")
+        self.status.addPermanentWidget(self.lbl_author)
 
         # Toolbar
         self._build_toolbar()
@@ -830,12 +989,13 @@ class GiftFormatterMainWindow(QMainWindow):
         # Auto convert timer
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
-        self._timer.timeout.connect(self.convert_now)
+        self._timer.timeout.connect(self.convert_auto)
 
         self.input_edit.textChanged.connect(self._on_text_changed)
         self.correct_combo.currentTextChanged.connect(self._on_text_changed)
         self.assume_default_cb.stateChanged.connect(self._on_text_changed)
         self.tolerant_cb.stateChanged.connect(self._on_text_changed)
+        self.multi_mode_combo.currentIndexChanged.connect(self._on_text_changed)
 
         self.lang_combo.currentIndexChanged.connect(self._on_language_changed)
 
@@ -843,8 +1003,10 @@ class GiftFormatterMainWindow(QMainWindow):
         self.last_stats: Optional[Stats] = None
         self.last_fixes: int = 0
         self.last_questions: List[QuestionItem] = []
+        self.last_issues: List[ConvertIssue] = []
         self.stats_dialog: Optional[StatsDialog] = None
         self.preview_dialog: Optional[PreviewDialog] = None
+        self.issues_dialog: Optional[IssuesDialog] = None
 
         # Load settings & apply language
         self.load_settings()
@@ -872,6 +1034,16 @@ class GiftFormatterMainWindow(QMainWindow):
         self.auto_cb.setText(self.tr_("controls_auto"))
         self.tolerant_cb.setText(self.tr_("controls_tolerant"))
         self.lbl_language.setText(self.tr_("controls_language"))
+        self.lbl_multi_mode.setText(self.tr_("controls_multi_mode"))
+
+        cur = self.multi_mode_combo.currentData()
+        self.multi_mode_combo.blockSignals(True)
+        self.multi_mode_combo.clear()
+        self.multi_mode_combo.addItem(self.tr_("multi_wipe"), "wipe")
+        self.multi_mode_combo.addItem(self.tr_("multi_penalize"), "penalize")
+        idx = 0 if cur != "penalize" else 1
+        self.multi_mode_combo.setCurrentIndex(idx)
+        self.multi_mode_combo.blockSignals(False)
 
         self.lbl_input.setText(self.tr_("label_input"))
         self.lbl_output.setText(self.tr_("label_output"))
@@ -879,6 +1051,7 @@ class GiftFormatterMainWindow(QMainWindow):
         self.correct_combo.setToolTip(self.tr_("tooltip_default_correct"))
         self.auto_cb.setToolTip(self.tr_("tooltip_auto"))
         self.tolerant_cb.setToolTip(self.tr_("tooltip_tolerant"))
+        self.multi_mode_combo.setToolTip(self.tr_("tooltip_multi_mode"))
 
         self.input_edit.setPlaceholderText(self.tr_("placeholder"))
 
@@ -894,7 +1067,11 @@ class GiftFormatterMainWindow(QMainWindow):
         self.act_auto.setText(self.tr_("toolbar_auto"))
         self.act_auto.setToolTip(self.tr_("tooltip_auto_action"))
 
-        # Refresh open dialogs titles/labels
+        self.act_issues.setText(self.tr_("toolbar_issues"))
+        self.act_issues.setToolTip(self.tr_("tooltip_issues"))
+
+        self.lbl_author.setText(self.tr_("author_label"))
+
         if self.stats_dialog is not None:
             was_visible = self.stats_dialog.isVisible()
             self.stats_dialog.close()
@@ -909,6 +1086,10 @@ class GiftFormatterMainWindow(QMainWindow):
             self.preview_dialog.set_questions(self.last_questions, 0)
             if was_visible:
                 self.preview_dialog.show()
+
+        if self.issues_dialog is not None:
+            self.issues_dialog.setWindowTitle(self.tr_("issues_title"))
+            self.issues_dialog.set_issues(self.last_issues)
 
     def _on_language_changed(self):
         lang_code = self.lang_combo.currentData()
@@ -956,6 +1137,11 @@ class GiftFormatterMainWindow(QMainWindow):
         self.act_preview.triggered.connect(self.show_preview)
         tb.addAction(self.act_preview)
 
+        self.act_issues = QAction("", self)
+        self.act_issues.setShortcut("Ctrl+W")
+        self.act_issues.triggered.connect(self.show_issues)
+        tb.addAction(self.act_issues)
+
         tb.addSeparator()
 
         self.act_auto = QAction("", self)
@@ -984,12 +1170,15 @@ class GiftFormatterMainWindow(QMainWindow):
         assume_default = self.settings.value("ui/assume_default", True, type=bool)
         tolerant = self.settings.value("ui/tolerant", True, type=bool)
         default_key = self.settings.value("ui/default_correct", "a")
+        multi_mode = self.settings.value("ui/multi_mode", "wipe")
 
         self.auto_cb.setChecked(bool(auto))
         self.act_auto.setChecked(bool(auto))
         self.assume_default_cb.setChecked(bool(assume_default))
         self.tolerant_cb.setChecked(bool(tolerant))
         self.correct_combo.setCurrentText(str(default_key))
+
+        self.multi_mode_combo.setCurrentIndex(1 if str(multi_mode) == "penalize" else 0)
 
         geom = self.settings.value("ui/geometry")
         if geom is not None:
@@ -1011,6 +1200,7 @@ class GiftFormatterMainWindow(QMainWindow):
         self.settings.setValue("ui/assume_default", self.assume_default_cb.isChecked())
         self.settings.setValue("ui/tolerant", self.tolerant_cb.isChecked())
         self.settings.setValue("ui/default_correct", self.correct_combo.currentText().strip() or "a")
+        self.settings.setValue("ui/multi_mode", self.multi_mode_combo.currentData() or "wipe")
         self.settings.setValue("ui/geometry", self.saveGeometry())
         self.settings.setValue("ui/splitter_sizes", self.splitter.sizes())
 
@@ -1022,11 +1212,12 @@ class GiftFormatterMainWindow(QMainWindow):
 
     def _on_text_changed(self, *_args):
         if self.act_auto.isChecked() != self.auto_cb.isChecked():
+            self.act_auto.setCheckable(True)
             self.act_auto.setChecked(self.auto_cb.isChecked())
 
         if not self.auto_cb.isChecked():
             return
-        self._timer.start(300)
+        self._timer.start(3000)
 
     def highlight_span(self, start: int, end: int):
         cursor = self.input_edit.textCursor()
@@ -1036,6 +1227,9 @@ class GiftFormatterMainWindow(QMainWindow):
         self.input_edit.ensureCursorVisible()
         self.input_edit.setFocus()
 
+    def convert_auto(self):
+        self.convert_now(silent=True, from_auto=True)
+
     # -------- Actions --------
 
     def clear_all(self):
@@ -1044,23 +1238,33 @@ class GiftFormatterMainWindow(QMainWindow):
         self.last_stats = None
         self.last_fixes = 0
         self.last_questions = []
+        self.last_issues = []
+
         if self.stats_dialog is not None:
             self.stats_dialog.set_stats(self.last_stats, self.last_fixes)
         if self.preview_dialog is not None:
             self.preview_dialog.set_questions([], 0)
+        if self.issues_dialog is not None:
+            self.issues_dialog.set_issues([])
+
         self.status.showMessage(self.tr_("status_cleared"), 2000)
 
-    def convert_now(self):
+    def convert_now(self, silent: bool = False, from_auto: bool = False):
         text = self.input_edit.toPlainText()
         default_key = self.correct_combo.currentText().strip() or "a"
         assume_default = self.assume_default_cb.isChecked()
         tolerant = self.tolerant_cb.isChecked()
+        multi_mode = self.multi_mode_combo.currentData() or "wipe"
+
+        text_for_convert = text_without_last_incomplete_block(text) if from_auto else text
 
         out, issues, stats, fixes, questions = convert_blocks_with_positions(
-            text,
+            text_for_convert,
             default_correct_key=default_key,
             assume_default_if_unmarked=assume_default,
             tolerant=tolerant,
+            multi_mode=str(multi_mode),
+            pct_decimals=3,
         )
 
         self.output_edit.setPlainText(out)
@@ -1068,46 +1272,51 @@ class GiftFormatterMainWindow(QMainWindow):
         self.last_stats = stats
         self.last_fixes = fixes
         self.last_questions = questions
+        self.last_issues = issues
 
         if self.stats_dialog is not None:
             self.stats_dialog.set_stats(self.last_stats, self.last_fixes)
 
         if self.preview_dialog is not None:
-            # keep current index if possible
             current_idx = self.preview_dialog.index if self.preview_dialog.questions else 0
             self.preview_dialog.set_questions(self.last_questions, current_idx)
+
+        if self.issues_dialog is not None:
+            self.issues_dialog.set_issues(self.last_issues)
 
         errors = [i for i in issues if i.severity == "error"]
         warnings = [i for i in issues if i.severity == "warning"]
 
         if not text.strip():
-            self.status.showMessage(self.tr_("status_empty"), 3000)
+            if not silent:
+                self.status.showMessage(self.tr_("status_empty"), 3000)
             return
 
-        # Inform about fixes (non-intrusive)
-        if tolerant and fixes > 0:
+        if tolerant and fixes > 0 and not silent:
             self.status.showMessage(self.tr_("status_fixes", n=fixes), 2500)
 
         if errors:
-            first = errors[0]
-            if first.start != first.end:
-                self.highlight_span(first.start, first.end)
-            self.status.showMessage(self.tr_("status_err", e=len(errors), w=len(warnings)), 6000)
+            if not silent:
+                first = errors[0]
+                if first.start != first.end:
+                    self.highlight_span(first.start, first.end)
+                self.status.showMessage(self.tr_("status_err", e=len(errors), w=len(warnings)), 6000)
 
-            if not out.strip():
-                msg = "\n".join([f"Block {i.block_index}: {i.message}" for i in errors[:20]])
-                if len(errors) > 20:
-                    msg += f"\n... and {len(errors) - 20} more."
-                QMessageBox.warning(self, self.tr_("msg_convert_failed_title"), msg)
-
+                if not out.strip():
+                    msg = "\n".join([f"Block {i.block_index}: {i.message}" for i in errors[:20]])
+                    if len(errors) > 20:
+                        msg += f"\n... and {len(errors) - 20} more."
+                    QMessageBox.warning(self, self.tr_("msg_convert_failed_title"), msg)
         elif warnings:
-            first = warnings[0]
-            if first.start != first.end:
-                self.highlight_span(first.start, first.end)
-            self.status.showMessage(self.tr_("status_warn", w=len(warnings)), 5000)
+            if not silent:
+                first = warnings[0]
+                if first.start != first.end:
+                    self.highlight_span(first.start, first.end)
+            hint = " (Ctrl+W)"
+            self.status.showMessage(self.tr_("status_warn", w=len(warnings)) + hint, 3000 if silent else 5000)
         else:
-            count = out.count("\n}") + (1 if out.strip() else 0)
-            self.status.showMessage(self.tr_("status_ok", count=count), 4000)
+            count = len(questions)
+            self.status.showMessage(self.tr_("status_ok", count=count), 2500 if silent else 4000)
 
     def copy_output(self):
         QApplication.clipboard().setText(self.output_edit.toPlainText())
@@ -1142,14 +1351,13 @@ class GiftFormatterMainWindow(QMainWindow):
             self.stats_dialog = StatsDialog(self, self.tr_, self.last_stats, self.last_fixes)
         else:
             self.stats_dialog.set_stats(self.last_stats, self.last_fixes)
+
         self.stats_dialog.show()
         self.stats_dialog.raise_()
         self.stats_dialog.activateWindow()
 
     def show_preview(self):
-        # Ensure we have up-to-date questions (especially if auto-convert off)
         if not self.last_questions:
-            # Try quick convert without changing output too aggressively:
             self.convert_now()
 
         if not self.last_questions:
@@ -1163,6 +1371,17 @@ class GiftFormatterMainWindow(QMainWindow):
         self.preview_dialog.raise_()
         self.preview_dialog.activateWindow()
 
+    def show_issues(self):
+        if self.issues_dialog is None:
+            self.issues_dialog = IssuesDialog(self, self.tr_, self.highlight_span)
+
+        self.issues_dialog.setWindowTitle(self.tr_("issues_title"))
+        self.issues_dialog.set_issues(self.last_issues)
+
+        self.issues_dialog.show()
+        self.issues_dialog.raise_()
+        self.issues_dialog.activateWindow()
+
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
@@ -1172,6 +1391,6 @@ if __name__ == "__main__":
         app.setWindowIcon(QIcon(str(icon_path)))
 
     w = GiftFormatterMainWindow(icon_path=icon_path)
-    w.resize(1020, 840)
+    w.resize(1020, 880)
     w.show()
     sys.exit(app.exec())
