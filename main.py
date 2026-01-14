@@ -1541,8 +1541,11 @@ class GiftFormatterMainWindow(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
 
-    with open("style.qss", "r", encoding="utf-8") as f:
-        app.setStyleSheet(f.read())
+    style_path = Path(__file__).parent / "style.qss"
+    if style_path.exists():
+        app.setStyleSheet(style_path.read_text(encoding="utf-8"))
+    else:
+        app.setStyleSheet(LIGHT_QSS)
 
     icon_path = Path(__file__).parent / "icon.png"
     if icon_path.exists():
