@@ -1,6 +1,7 @@
 import re
 import sys
 from dataclasses import dataclass
+from docx import Document
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict, Any
 
@@ -794,7 +795,37 @@ class PreviewDialog(QDialog):
             self.index += 1
             self._render()
 
-
+class FileDropPlainTextEdit(QPlainTextEdit):
+    """
+    QPlainTextEdit that accepts file drag&drop and emits local file paths
+    """
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.setAcceptDrops(True)
+        self.on_file_dropped = None #callback(path: str) -> None
+        
+    def dragEnterEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasUrls():
+            urls = md.urls()
+            if urls and urls[0].isLocalFile():
+                event.acceptProposedAction()
+                return
+        event.ignore()
+        
+    def dropEvent(self, event):
+        md = event.mimeData()
+        if md and md.hasUrls():
+            for url in md.urls():
+                if url.isLocalFile():
+                    path = url.toLocalFile()
+                    if callable(self.on_file_dropped):
+                        self.on_file_dropped(path)
+                    break
+                event.acceptProposedAction()
+                return
+            event.ignore()
 # ---------- Main window ----------
 
 class GiftFormatterMainWindow(QMainWindow):
@@ -885,6 +916,12 @@ class GiftFormatterMainWindow(QMainWindow):
                     "b) Špatně\n"
                     "c)* Správně\n"
                 ),
+                "toolbar_open": "📂 Otevřít",
+                "tooltip_open": "Načíst text ze souboru do vstupu (Ctrl+O).",
+                "msg_open_title": "Otevřít soubor",
+                "msg_open_failed_title": "Načtení selhalo",
+                "status_loaded": "Načteno: {path}",
+
             },
             "en": {
                 "app_title": "GIFT formatter",
@@ -960,6 +997,11 @@ class GiftFormatterMainWindow(QMainWindow):
                     "b) Wrong\n"
                     "c)* Correct\n"
                 ),
+                "toolbar_open": "📂 Open",
+                "tooltip_open": "Load text from a file into Input (Ctrl+O).",
+                "msg_open_title": "Open file",
+                "msg_open_failed_title": "Load failed",
+                "status_loaded": "Loaded: {path}",
             },
         }
 
@@ -1014,7 +1056,8 @@ class GiftFormatterMainWindow(QMainWindow):
         layout.addLayout(controls)
 
         # Editors
-        self.input_edit = QPlainTextEdit()
+        self.input_edit = FileDropPlainTextEdit()
+        self.input_edit.on_file_dropped = self.load_text_file
         self.output_edit = QPlainTextEdit()
         self.output_edit.setReadOnly(True)
 
@@ -1199,6 +1242,8 @@ class GiftFormatterMainWindow(QMainWindow):
         self.act_stats.setToolTip(self.tr_("tooltip_stats"))
         self.act_preview.setToolTip(self.tr_("toolbar_preview"))
         self.act_preview.setToolTip(self.tr_("tooltip_preview"))
+        self.act_open.setText(self.tr_("toolbar_open"))
+        self.act_open.setToolTip(self.tr_("tooltip_open"))
 
         self.act_auto.setText(self.tr_("toolbar_auto"))
         self.act_auto.setToolTip(self.tr_("tooltip_auto_action"))
@@ -1249,6 +1294,11 @@ class GiftFormatterMainWindow(QMainWindow):
         self.addToolBar(tb)
 
         # --- Actions ---
+        self.act_open = QAction("", self)
+        self.act_open.setShortcut("Ctrl+O")
+        self.act_open.triggered.connect(self.open_file)
+        tb.addAction(self.act_open)
+        
         self.act_convert = QAction(self._icon("view-refresh", QStyle.SP_BrowserReload), "", self)
         self.act_convert.setShortcut("Ctrl+Enter")
         self.act_convert.triggered.connect(self.convert_now)
@@ -1310,6 +1360,79 @@ class GiftFormatterMainWindow(QMainWindow):
             2000,
         )
         self.settings.setValue("ui/auto_convert", checked)
+        
+    def open_file(self):
+        start_dir = self.settings.value("ui/last_dir", str(Path.home()))
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            self.tr_("msg_open_title"),
+            start_dir,
+            "Text/Word (*.txt, *.gift, *.md, *.docx);;All files (*.*)",
+        )
+        if not path:
+            return
+        self.load_text_file(path)
+    
+    def load_text_file(self, path: str):
+        # 1) vždy hned normalizuj path a vytvoř Path objekt
+        try:
+            p = Path(str(path)).expanduser()
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed", f"Invalid path:\n{path}\n\n{e}")
+            return
+
+        # 2) základní validace
+        if not p.exists() or not p.is_file():
+            QMessageBox.warning(self, "Load failed", f"File not found:\n{p}")
+            return
+
+        suffix = p.suffix.lower()
+
+        # 3) docx větev (pokud ji chceš)
+        if suffix == ".docx":
+            try:
+                from docx import Document
+                doc = Document(str(p))
+                text = "\n".join(par.text for par in doc.paragraphs)
+                self.input_edit.setPlainText(text)
+                self.convert_now()
+                return
+            except Exception as e:
+                QMessageBox.critical(self, "Load failed", f"Cannot read .docx:\n{e}")
+                return
+
+        # 4) zbytek – textové soubory
+        try:
+            data = p.read_bytes()
+        except Exception as e:
+            QMessageBox.critical(self, "Load failed", f"Cannot read file:\n{p}\n\n{e}")
+            return
+
+        # jednoduchá detekce binárního souboru
+        if b"\x00" in data[:4096]:
+            QMessageBox.warning(
+                self,
+                "Load failed",
+                "This file looks like a binary file (e.g., .pdf/image).\n"
+                "Please use a plain text file (.txt/.gift/.md) or .docx."
+            )
+            return
+
+        text = None
+        for enc in ("utf-8-sig", "utf-8", "cp1250", "latin-1"):
+            try:
+                text = data.decode(enc)
+                break
+            except Exception:
+                continue
+
+        if text is None:
+            QMessageBox.critical(self, "Load failed", f"Cannot decode file:\n{p}")
+            return
+
+        self.input_edit.setPlainText(text)
+        self.convert_now()
+
 
     # -------- QSettings --------
 
